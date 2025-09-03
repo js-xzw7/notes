@@ -22,6 +22,126 @@ rabbitMQ术语
 
 *一对一，一生产者， 一个消费者。*
 
+###### 示例
+
+生产者：
+
+```go
+package main
+
+import (
+    "context"
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "time"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+func main() {
+    //1.连接rabbitmq服务器
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "Failed to connect to rabbitmq")
+    defer conn.Close()
+
+    //2.创建通道，大部分用于完成操作的api都驻留在通道中
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明要发送的队列,声明队列是幂等的，只有当队列不存在时才会创建
+    q, err := ch.QueueDeclare(
+       "hello",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to declare a queue")
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    body := "Hello World!"
+    err = ch.PublishWithContext(
+       ctx,
+       "",
+       q.Name,
+       false,
+       false,
+       amqp.Publishing{
+          ContentType: "text/plain",
+          Body:        []byte(body),
+       })
+
+    failOnError(err, "failed to publish a message")
+    log.Printf("[x] sent %s \n", body)
+}
+```
+
+消费者：
+
+```go
+package main
+
+import (
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func main() {
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "failed to connect to rabbitMQ")
+    defer conn.Close()
+
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    q, err := ch.QueueDeclare(
+       "hello",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+
+    failOnError(err, "failed to declare a queue")
+
+    msgs, err := ch.Consume(
+       q.Name,
+       "",
+       true,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to register a consumer")
+
+    var forever chan struct{}
+    go func() {
+       for d := range msgs {
+          log.Printf("received a message:%s", d.Body)
+       }
+    }()
+
+    log.Printf("[*] waiting for messages, to exit press ctrl+c")
+    <-forever
+}
+```
+
 ##### 2.工作队列
 
 *一对多，一个生产者，多个消费者。*用于多个工作线程之间分配耗时任务。
@@ -56,7 +176,712 @@ rabbitMQ术语
 
 为了解决这个问题，我们可以将预取计数设置为`1`。这将告诉 RabbitMQ 不要一次向一个 Worker 发送多条消息。或者换句话说，在 Worker 处理并确认上一条消息之前，不要向它发送新消息。相反，它会将新消息发送给下一个仍处于空闲状态的 Worker。
 
+###### 示例
+
+生产者
+
+```go
+package main
+
+import (
+    "context"
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "os"
+    "strings"
+    "time"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func bodyFrom(args []string) string {
+    var s string
+    if (len(args) < 2) || os.Args[1] == "" {
+       s = "hello"
+    } else {
+       s = strings.Join(args[1:], " ")
+    }
+    return s
+}
+func main() {
+    //1.连接rabbitmq服务器
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "Failed to connect to rabbitmq")
+    defer conn.Close()
+
+    //2.创建通道，大部分用于完成操作的api都驻留在通道中
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明要发送的队列,声明队列是幂等的，只有当队列不存在时才会创建
+    q, err := ch.QueueDeclare(
+       "hello",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to declare a queue")
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    body := bodyFrom(os.Args)
+    err = ch.PublishWithContext(
+       ctx,
+       "",
+       q.Name,
+       false,
+       false,
+       amqp.Publishing{
+          DeliveryMode: amqp.Persistent,
+          ContentType:  "text/plain",
+          Body:         []byte(body),
+       })
+
+    failOnError(err, "failed to publish a message")
+    log.Printf("[x] sent %s \n", body)
+}
+```
+
+消费者
+
+```go
+package main
+
+import (
+    "bytes"
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "time"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func main() {
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "failed to connect to rabbitMQ")
+    defer conn.Close()
+
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    q, err := ch.QueueDeclare(
+       "hello",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+
+    failOnError(err, "failed to declare a queue")
+
+    msgs, err := ch.Consume(
+       q.Name,
+       "",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to register a consumer")
+
+    var forever chan struct{}
+    go func() {
+       for d := range msgs {
+          log.Printf("received a message:%s", d.Body)
+          dotCount := bytes.Count(d.Body, []byte("."))
+          t := time.Duration(dotCount)
+          time.Sleep(t * time.Second)
+          log.Printf("Done")
+          d.Ack(false)
+       }
+    }()
+
+    log.Printf("[*] waiting for messages, to exit press ctrl+c")
+    <-forever
+}
+```
+
+
+
 ##### 3.发布/订阅
 
+*一对多* 
 
+工作队列的假设是每个任务只会传递给一个工作线程，如果将一条消息传递给多个消费者，这种模式被称为“发布/订阅”
 
+rabbitMQ消息模型的核心思想是**生产者永远不会直接向队列发送消息**。实际上，生产者很多时候甚至不知道消息是否会被投递到任何队列。
+
+###### 交换机
+
+生产者只能将消息发送到**交换机**。交换机非常简单，它一方面接收来来自生产者的消息，另一方面将消息推送到消息队列。
+
+######  交换机类型
+
+交换机必须确切地知道如果处理收到的消息。应该将其添加到特定的队列吗？应该将其添加到多个队列吗？还是应该放弃？这些规则由交换机类型定义，可用交换机类型：direct、topic、headers、fanout。
+
+默认交换机：空字符串（""）标识；如果不声明交换机，使用“”标识，也是能够向队列发送消息的
+
+###### 临时队列
+
+当我们声明一个队列时，提供的队列名为空字符串时，会创建一个具有生成名称的非持久队列。一旦消费者断开连接，队列自动删除。如果我们只是对当前正在流转的的消息感兴趣，而不是旧的消息（比如日志消息），临时队列对我们很有用
+
+###### 示例
+
+生产者：
+
+```go
+package main
+
+import (
+    "context"
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "os"
+    "strings"
+    "time"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func bodyFrom(args []string) string {
+    var s string
+    if (len(args) < 2) || os.Args[1] == "" {
+       s = "hello"
+    } else {
+       s = strings.Join(args[1:], " ")
+    }
+    return s
+}
+func main() {
+    //1.连接rabbitmq服务器
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "Failed to connect to rabbitmq")
+    defer conn.Close()
+
+    //2.创建通道，大部分用于完成操作的api都驻留在通道中
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明交换机
+    err = ch.ExchangeDeclare(
+       "logs",
+       "fanout",
+       true,
+       false,
+       false,
+       false,
+       nil,
+    )
+
+    failOnError(err, "failed to declare an exchange")
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    body := bodyFrom(os.Args)
+    err = ch.PublishWithContext(
+       ctx,
+       "logs",
+       "",
+       false,
+       false,
+       amqp.Publishing{
+          DeliveryMode: amqp.Persistent,
+          ContentType:  "text/plain",
+          Body:         []byte(body),
+       })
+
+    failOnError(err, "failed to publish a message")
+    log.Printf("[x] sent %s \n", body)
+}
+```
+
+消费者：
+
+```go
+package main
+
+import (
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func main() {
+    //1.建立连接
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "failed to connect to rabbitMQ")
+    defer conn.Close()
+
+    //2.建立通道
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明交换机
+    err = ch.ExchangeDeclare(
+       "logs",
+       "fanout",
+       true,
+       false,
+       false,
+       false,
+       nil,
+    )
+
+    failOnError(err, "failed to declare an exchange")
+
+    //4.声明队列
+    q, err := ch.QueueDeclare(
+       "",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to declare a queue")
+
+    //5.绑定队列
+    err = ch.QueueBind(
+       q.Name,
+       "",
+       "logs",
+       false,
+       nil)
+
+    failOnError(err, "failed to bind a queue")
+
+    //6.消费队列
+    msgs, err := ch.Consume(
+       q.Name,
+       "",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to register a consumer")
+
+    var forever chan struct{}
+    go func() {
+       for d := range msgs {
+          log.Printf(" [x] %s", d.Body)
+
+       }
+    }()
+
+    log.Printf("[*] waiting for messages, to exit press ctrl+c")
+    <-forever
+}
+```
+
+##### 4.路由
+
+订阅消息队列中的子集。比如日志消息仅将关键错误信息定向到日志文件
+
+###### 示例
+
+生产者：
+
+```go
+package main
+
+import (
+    "context"
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "os"
+    "strings"
+    "time"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func bodyFrom(args []string) string {
+    var s string
+    if (len(args) < 2) || os.Args[1] == "" {
+       s = "hello"
+    } else {
+       s = strings.Join(args[1:], " ")
+    }
+    return s
+}
+
+func severityFrom(args []string) string {
+    var s string
+    if (len(args) < 2) || os.Args[1] == "" {
+       s = "info"
+    } else {
+       s = os.Args[1]
+    }
+
+    return s
+}
+func main() {
+    //1.连接rabbitmq服务器
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "Failed to connect to rabbitmq")
+    defer conn.Close()
+
+    //2.创建通道，大部分用于完成操作的api都驻留在通道中
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明交换机
+    err = ch.ExchangeDeclare(
+       "logs_direct",
+       "direct",
+       true,
+       false,
+       false,
+       false,
+       nil,
+    )
+
+    failOnError(err, "failed to declare an exchange")
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    body := bodyFrom(os.Args)
+    err = ch.PublishWithContext(
+       ctx,
+       "logs_direct",
+       severityFrom(os.Args),
+       false,
+       false,
+       amqp.Publishing{
+          DeliveryMode: amqp.Persistent,
+          ContentType:  "text/plain",
+          Body:         []byte(body),
+       })
+
+    failOnError(err, "failed to publish a message")
+    log.Printf("[x] sent %s \n", body)
+}
+```
+
+消费者：
+
+```go
+package main
+
+import (
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "os"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func main() {
+    //1.建立连接
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "failed to connect to rabbitMQ")
+    defer conn.Close()
+
+    //2.建立通道
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明交换机
+    err = ch.ExchangeDeclare(
+       "logs_direct",
+       "direct",
+       true,
+       false,
+       false,
+       false,
+       nil,
+    )
+
+    failOnError(err, "failed to declare an exchange")
+
+    //4.声明队列
+    q, err := ch.QueueDeclare(
+       "",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to declare a queue")
+
+    if len(os.Args) < 2 {
+       log.Printf("Usage: %s [info] [warning] [error]", os.Args[0])
+       os.Exit(0)
+    }
+
+    for _, s := range os.Args[1:] {
+       log.Printf("Binding queue %s to exchange %s with routing key %s", q.Name, "logs_direct", s)
+       //5.绑定队列
+       err = ch.QueueBind(
+          q.Name,
+          s,
+          "logs_direct",
+          false,
+          nil)
+
+       failOnError(err, "failed to bind a queue")
+    }
+
+    //6.消费队列
+    msgs, err := ch.Consume(
+       q.Name,
+       "",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to register a consumer")
+
+    var forever chan struct{}
+    go func() {
+       for d := range msgs {
+          log.Printf(" [x] %s", d.Body)
+
+       }
+    }()
+
+    log.Printf("[*] waiting for messages, to exit press ctrl+c")
+    <-forever
+}
+```
+
+##### 5.主题
+
+ 路由模式改进了我们的系统，但它仍然存在局限性 - 它无法根据多个条件进行路由。
+
+发送到 `topic` 交换机的消息不能具有任意的 `routing_key` - 它必须是单词列表，用点分隔。单词可以是任何内容，但通常它们指定与消息相关的某些特征。一些有效的路由键示例：`stock.usd.nyse`, `nyse.vmw`, `quick.orange.rabbit`。路由键中可以包含任意数量的单词，最多 255 字节的限制。
+
+绑定键也必须采用相同的形式。`topic` 交换机背后的逻辑类似于 `direct` 交换机 - 使用特定路由键发送的消息将被传递到所有使用匹配绑定键绑定的队列。但是，绑定键有两个重要的特殊情况
+
+- `*` (星号) 可以替代正好一个单词。
+- `#` (井号) 可以替代零个或多个单词。
+
+###### 主题 (Topic) 交换机
+
+主题 (Topic) 交换机功能强大，可以像其他交换机一样工作。
+
+当队列绑定了 `#` (井号) 绑定键时 - 它将接收所有消息，无论路由键如何 - 就像 `fanout` 交换机一样。
+
+当特殊字符 `*` (星号) 和 `#` (井号) 未在绑定中使用时，主题 (topic) 交换机将像 `direct` 交换机一样工作。
+
+###### 示例
+
+生产者：
+
+```go
+package main
+
+import (
+    "context"
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "os"
+    "strings"
+    "time"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func bodyFrom(args []string) string {
+    var s string
+    if (len(args) < 2) || os.Args[1] == "" {
+       s = "hello"
+    } else {
+       s = strings.Join(args[1:], " ")
+    }
+    return s
+}
+
+func severityFrom(args []string) string {
+    var s string
+    if (len(args) < 2) || os.Args[1] == "" {
+       s = "info"
+    } else {
+       s = os.Args[1]
+    }
+
+    return s
+}
+func main() {
+    //1.连接rabbitmq服务器
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "Failed to connect to rabbitmq")
+    defer conn.Close()
+
+    //2.创建通道，大部分用于完成操作的api都驻留在通道中
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明交换机
+    err = ch.ExchangeDeclare(
+       "logs_topic",
+       "topic",
+       true,
+       false,
+       false,
+       false,
+       nil,
+    )
+
+    failOnError(err, "failed to declare an exchange")
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    body := bodyFrom(os.Args)
+    err = ch.PublishWithContext(
+       ctx,
+       "logs_topic",
+       severityFrom(os.Args),
+       false,
+       false,
+       amqp.Publishing{
+          DeliveryMode: amqp.Persistent,
+          ContentType:  "text/plain",
+          Body:         []byte(body),
+       })
+
+    failOnError(err, "failed to publish a message")
+    log.Printf("[x] sent %s \n", body)
+}
+```
+
+消费者：
+
+```go
+package main
+
+import (
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "os"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func main() {
+    //1.建立连接
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "failed to connect to rabbitMQ")
+    defer conn.Close()
+
+    //2.建立通道
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明交换机
+    err = ch.ExchangeDeclare(
+       "logs_topic",
+       "topic",
+       true,
+       false,
+       false,
+       false,
+       nil,
+    )
+
+    failOnError(err, "failed to declare an exchange")
+
+    //4.声明队列
+    q, err := ch.QueueDeclare(
+       "",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to declare a queue")
+
+    if len(os.Args) < 2 {
+       log.Printf("Usage: %s [info] [warning] [error]", os.Args[0])
+       os.Exit(0)
+    }
+
+    for _, s := range os.Args[1:] {
+       log.Printf("Binding queue %s to exchange %s with routing key %s", q.Name, "logs_direct", s)
+       //5.绑定队列
+       err = ch.QueueBind(
+          q.Name,
+          s,
+          "logs_topic",
+          false,
+          nil)
+
+       failOnError(err, "failed to bind a queue")
+    }
+
+    //6.消费队列
+    msgs, err := ch.Consume(
+       q.Name,
+       "",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to register a consumer")
+
+    var forever chan struct{}
+    go func() {
+       for d := range msgs {
+          log.Printf(" [x] %s", d.Body)
+
+       }
+    }()
+
+    log.Printf("[*] waiting for messages, to exit press ctrl+c")
+    <-forever
+}
+```
