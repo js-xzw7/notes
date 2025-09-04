@@ -885,3 +885,273 @@ func main() {
     <-forever
 }
 ```
+
+##### 6.rpc
+
+在[第二个教程](https://www.rabbitmq.com/tutorials/tutorial-two-go)中，我们学习了如何使用*工作队列*在多个工作者之间分配耗时的任务。
+
+但是，如果我们需要在远程计算机上运行某个函数并等待结果呢？那就另当别论了。这种模式通常称为*远程过程调用*( *RPC)*。
+
+###### 回调队列
+
+RabbitMQ 中的请求-答复模式涉及服务器和客户端之间的直接交互。
+
+客户端发送请求消息，服务器回复响应消息。
+
+为了接收响应，我们需要在请求中发送一个“回调”队列名称。此类队列通常[以服务器命名，](https://www.rabbitmq.com/docs/queues#server-named-queues)但也可以采用一个众所周知的名称（以客户端命名）。
+
+然后服务器将使用该名称通过[默认交换](https://www.rabbitmq.com/docs/exchanges#default-exchange)进行响应。
+
+*** 消息属性***
+
+AMQP 0-9-1 协议预定义了一组 14 个与消息相关的属性。大多数属性很少使用，但以下属性除外：
+
+- `persistent`：将消息标记为持久消息（值为`true`）或瞬态消息（`false`）。您可能还记得[第二个教程](https://www.rabbitmq.com/tutorials/tutorial-two-go)中的这个属性。
+- `content_type`：用于描述编码的 MIME 类型。例如，对于常用的 JSON 编码，建议将此属性设置为：`application/json`。
+- `reply_to`：通常用于命名回调队列。
+- `correlation_id`：有助于将 RPC 响应与请求关联起来。
+
+###### 关联id
+
+为每个 RPC 请求创建回调队列效率低下。更好的方法是为每个客户端创建一个回调队列。
+
+这就引发了一个新问题：在队列中收到响应后，我们无法确定该响应属于哪个请求。这时就需要 `correlation_id`用到该属性了。我们将为每个请求设置一个唯一的值。稍后，当我们在回调队列中收到消息时，我们会检查此属性，并据此将响应与请求匹配。如果看到未知值 `correlation_id`，我们可以放心地丢弃该消息——因为它不属于我们的请求。
+
+你可能会问，为什么我们应该忽略回调队列中的未知消息，而不是直接报错？这是因为服务器端可能存在竞争条件。虽然可能性不大，但 RPC 服务器有可能在发送应答后、发送请求确认消息之前挂掉。如果发生这种情况，重启后的 RPC 服务器将再次处理该请求。这就是为什么我们必须在客户端优雅地处理重复响应，并且理想情况下 RPC 应该是幂等的。
+
+我们的 RPC 将像这样工作：
+
+- 当客户端启动时，它会创建一个独占的回调队列。
+- 对于 RPC 请求，客户端发送一条具有两个属性的消息： `reply_to`，设置为回调队列，以及`correlation_id`，为每个请求设置一个唯一值。
+- 请求被发送到`rpc_queue`队列。
+- RPC 工作进程（又称服务器）正在等待该队列中的请求。当有请求出现时，它会执行任务，并使用字段中的队列将结果消息发送回客户端`reply_to`。
+- 客户端在回调队列中等待数据。当出现消息时，它会检查该`correlation_id`属性。如果该属性与请求中的值匹配，则会将响应返回给应用程序。
+
+###### 示例
+
+server
+
+```go
+package main
+
+import (
+    "context"
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "strconv"
+    "time"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func fib(n int) int {
+    if n == 0 {
+       return 0
+    } else if n == 1 {
+       return 1
+    } else {
+       return fib(n-1) + fib(n-2)
+    }
+}
+
+func main() {
+    //1.连接rabbitmq服务器
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "Failed to connect to rabbitmq")
+    defer conn.Close()
+
+    //2.创建通道，大部分用于完成操作的api都驻留在通道中
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明通道
+    q, err := ch.QueueDeclare(
+       "rpc_queue",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+
+    failOnError(err, "failed to declare an queue")
+
+    //4.服务质量 控制服务器在收到交付确认之前，为消费者在网络中尝试保留的消息数量或字节数
+    // 运行多个服务器进程，为了将负载均衡分布到多个服务器上，我们需要设置prefetch通道
+    err = ch.Qos(
+       1,
+       0,
+       false,
+    )
+    failOnError(err, "failed to set Qos")
+
+    msgs, err := ch.Consume(
+       q.Name,
+       "",
+       false,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to register a consumer")
+
+    var forever chan struct{}
+    go func() {
+       ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+       defer cancel()
+       for d := range msgs {
+          n, err := strconv.Atoi(string(d.Body))
+          failOnError(err, "failed to convert body to integer")
+
+          log.Printf("[.]fib(%d)", n)
+          response := fib(n)
+
+          err = ch.PublishWithContext(
+             ctx,
+             "",
+             d.ReplyTo,
+             false,
+             false,
+             amqp.Publishing{
+                ContentType:   "text/plain",
+                CorrelationId: d.CorrelationId,
+                Body:          []byte(strconv.Itoa(response)),
+             })
+          failOnError(err, "failed to publish a message")
+
+          d.Ack(false)
+       }
+    }()
+
+    log.Printf("[*] Awaiting RPC requests")
+    <-forever
+}
+```
+
+client
+
+```go
+package main
+
+import (
+    "context"
+    amqp "github.com/rabbitmq/amqp091-go"
+    "log"
+    "math/rand"
+    "os"
+    "strconv"
+    "strings"
+    "time"
+)
+
+func failOnError(err error, msg string) {
+    if err != nil {
+       log.Panicf("%s:%s", msg, err)
+    }
+}
+
+func randomString(l int) string {
+    bytes := make([]byte, l)
+    for i := 0; i < l; i++ {
+       bytes[i] = byte(randInt(65, 90))
+    }
+    return string(bytes)
+}
+
+func randInt(min, max int) int {
+    return min + rand.Intn(max-min)
+}
+
+func fibonacciRPC(n int) (res int, err error) {
+    //1.建立连接
+    conn, err := amqp.Dial("amqp://guest:guest@124.222.86.11:5672/")
+    failOnError(err, "failed to connect to rabbitMQ")
+    defer conn.Close()
+
+    //2.声明通道
+    ch, err := conn.Channel()
+    failOnError(err, "failed to open a channel")
+    defer ch.Close()
+
+    //3.声明队列
+    q, err := ch.QueueDeclare(
+       "",
+       false,
+       false,
+       true,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to declare a queue")
+
+    //4.消费
+    msgs, err := ch.Consume(
+       q.Name,
+       "",
+       true,
+       false,
+       false,
+       false,
+       nil,
+    )
+    failOnError(err, "failed to register a consumer")
+
+    corrId := randomString(32)
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    err = ch.PublishWithContext(
+       ctx,
+       "",
+       "rpc_queue",
+       false,
+       false,
+       amqp.Publishing{
+          ContentType:   "text/plain",
+          CorrelationId: corrId,
+          ReplyTo:       q.Name,
+          Body:          []byte(strconv.Itoa(n)),
+       })
+    failOnError(err, "failed to publish a message")
+
+    for d := range msgs {
+       if corrId == d.CorrelationId {
+          res, err = strconv.Atoi(string(d.Body))
+          failOnError(err, "failed to convert body to integer")
+          break
+       }
+    }
+    return
+}
+
+func main() {
+    rand.Seed(time.Now().UTC().UnixNano())
+
+    n := bodyFrom(os.Args)
+
+    log.Printf(" [x] Requesting fib(%d)", n)
+    res, err := fibonacciRPC(n)
+    failOnError(err, "failed to handle rpc request")
+    log.Printf(" [.] Got %d", res)
+}
+
+func bodyFrom(args []string) int {
+    var s string
+    if (len(args) < 2) || os.Args[1] == "" {
+       s = "30"
+    } else {
+       s = strings.Join(args[1:], " ")
+    }
+
+    n, err := strconv.Atoi(s)
+    failOnError(err, "failed to convert arg to integer")
+    return n
+}
+```
+
